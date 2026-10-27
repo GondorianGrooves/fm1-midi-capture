@@ -1,0 +1,20 @@
+# Capture + playback diagnostic: play 4 single notes on a steady beat, press REC, let it loop.
+# keys bit k = key k (0 = F3). Key 0 = note 53 (F3). We play keys 0,2,4,5 as quarter notes ~120 BPM
+# (500 ms apart), each held ~250 ms, then REC at 2200, then let the loop run to 6000 ms.
+#
+# What to check in build/host/dinghy.wav and the "MIDI out" trace:
+#  - during 200..2000: four clean separate notes (live monitor)
+#  - after REC: the same four notes loop, cleanly, no doubling / no ring-mod / no stuck drone
+#  - "MIDI out" lines should show matched note-on / note-off pairs, never two note-ons for the
+#    same note without a note-off between them.
+
+200  keys 0x1          # key 0 (F3)  down
+450  keys 0x0          #             up
+700  keys 0x4          # key 2 (G3)  down
+950  keys 0x0
+1200 keys 0x10         # key 4 (A3)  down
+1450 keys 0x0
+1700 keys 0x20         # key 5 (A#3) down
+1950 keys 0x0
+2200 btn 13            # REC (FM-1 BTN_REC = 13): retrospective capture + launch loop
+6000 end

@@ -90,11 +90,16 @@ static void play(uint32_t note, uint32_t vel)
 {
     uint32_t v, pick = 0, best = 0xFFFFFFFFu;
     if (note > 127u || !vel) return;
-    for (v = 0; v < NV; v++) {                  /* the same note, else a free voice, else the oldest */
-        uint32_t score = voice[v].note == note && voice[v].gate ? 0u
-                       : voice[v].gate ? 0x80000000u + voice[v].age : (uint32_t)voice[v].amp + 1u;
+    /* A given pitch may occupy ONLY ONE voice: if this note already has a voice (even one in its
+     * release tail, gate == 0 but amp > 0), reuse it. Two voices on the same pitch with different
+     * phases beat against each other -> the "ring modulator" sound. */
+    for (v = 0; v < NV; v++)
+        if (voice[v].note == (uint8_t)note && (voice[v].gate || voice[v].amp)) { pick = v; goto set; }
+    for (v = 0; v < NV; v++) {                  /* else a free voice, else the oldest */
+        uint32_t score = voice[v].gate ? 0x80000000u + voice[v].age : (uint32_t)voice[v].amp + 1u;
         if (score < best) { best = score; pick = v; }
     }
+set:
     voice[pick].note = (uint8_t)note;
     voice[pick].age = ++ages;
     voice[pick].inc = INC_C9[note % 12u] >> (10u - note / 12u);

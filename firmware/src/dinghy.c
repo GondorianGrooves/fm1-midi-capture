@@ -1,21 +1,24 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 /* fm1-midi-capture: a retrospective MIDI looper / clip sequencer for the FM-1, built on Dinghy.
  *
- * Phase 1 (this build): one track at a time (SELECT picks 1..8), 8 clip slots on the top row of keys,
- * fixed-length loop capture with overdub, playback through the internal sine monitor and echoed to
- * USB-MIDI out. The bottom keys still play notes for testing.
+ * Always-listening retrospective capture (like Ableton Move / Live "Capture MIDI").
+ * Every note you play is logged to the active track's rolling history (the last 16 bars). You never
+ * "start" recording -- you just play. Pressing REC looks BACK at what you just played, detects the
+ * tempo and fits a whole number of bars (1..16), and launches that as a loop. The first capture sets
+ * the project's BPM; later captures snap to that grid so every track stays locked.
  *
  *   SELECT     the active track (1..8)
  *   top 8 keys (keys 19..26)   the 8 clip slots of the active track:
- *                - empty slot  -> arm it (capture starts on the first note, or on REC)
- *                - filled slot -> stop whatever plays on this track, start this clip, arm it
- *   bottom keys (0..18)        play the internal sine, recorded as MIDI input
- *   REC        empty/armed: start capture; recording: close the loop; playing: overdub on/off
+ *                - filled slot -> launch it (stops the track's current clip)
+ *                - the playing slot pressed again -> stop it
+ *   bottom keys (0..18)        play the internal sine; always logged to history
+ *   REC        retrospectively capture the recent history into the selected slot, detect BPM/bars,
+ *              and start looping. Pressing REC while a loop plays overdubs onto it.
  *   PLAY       start/stop the active track's clip
  *   OCT- OCT+  the octave (kept in flash)
  *   PRESETS    the MIDI channel: OMNI (in: all, out: 1) or 1..16 (kept in flash)
  *   MASTER     the volume (platform.c)
- *   MIDI in    notes from USB or the TRS jack play the sines and are captured; a clock shows its tempo
+ *   MIDI in    notes from USB or the TRS jack play the sines and are logged; a clock shows its tempo
  *
  * Dinghy's platform is untouched below. Rules (the chip has no FPU, no libgcc): integers only, no
  * float, no 64-bit division. tests/host.c runs this file on a computer (screen PNG, sound WAV).
@@ -114,50 +117,80 @@ static int quiet(void)                          /* nothing sounds, not even a re
 }
 
 /* ====================================================================================
- * LOOPER
+ * LOOPER (retrospective, always-listening)
  *
- * One track is "active" (SELECT picks it, 1..8). Each track has 8 clip slots; in Phase 1 only the
- * active track's clips live in RAM (NTRACK * NSLOT clips in the pool), and one clip per track may be
- * playing. A clip is a list of timestamped MIDI events; timestamps are ms from the clip's start, and
- * the clip loops every clip.len_ms. Capture is fixed-length: it runs from the first recorded event
- * until the loop is closed (REC again, or the armed pad pressed again).
+ * HISTORY: every incoming/played event on the active track is appended to a per-track ring with an
+ * absolute ms timestamp (fm1_ms). The ring always holds the last ~64 s (16 bars at the 60 BPM floor).
+ *
+ * CAPTURE: REC takes the span from the start of the recent phrase up to the REC press, detects the
+ * tempo (folded into 80..160 BPM, the range Ableton targets), fits 1..16 whole bars, back-solves the
+ * BPM so the loop is an exact whole number of bars (seamless), and launches it. The first capture sets
+ * the global BPM; later captures snap to that bar grid.
  * ==================================================================================== */
 #define NTRACK 8u
 #define NSLOT  8u
-#define CLIP_EVENTS 384u                        /* events per clip (tunable). 384*4 = 1536 B each */
+#define CLIP_EVENTS 384u                        /* events per clip. 384*6 ~= 2.3 KB each */
+#define HIST_EVENTS 512u                        /* per-track rolling history ring */
 #define PAD0 19u                                /* key 19..26 = the 8 clip slots (top row); keys 0..18 play notes */
+#define BPM_MIN 80u                             /* detection folds tempo into [80,160) */
+#define BPM_MAX 160u
+#define MAX_BARS 16u
+#define PHRASE_GAP_MS 2000u                     /* a gap longer than this starts a fresh phrase */
 
 typedef struct {
-    uint16_t ms;                                /* time from clip start, ms (loops < 64 s) */
+    uint16_t ms;                                /* time from clip start, ms */
     uint8_t  status;                            /* MIDI status incl. channel (0x90/0x80/0xB0/0xE0) */
-    uint8_t  d1, d2;                            /* data bytes */
+    uint8_t  d1, d2;
 } ev_t;
 
 typedef struct {
     uint16_t len_ms;                            /* loop length; 0 = empty slot */
-    uint16_t n;                                 /* number of events */
+    uint16_t n;
     ev_t     ev[CLIP_EVENTS];
 } clip_t;
 
-/* clips live in the big zeroed pool (NTRACK*NSLOT*~1.5 KB = ~98 KB) */
-static clip_t clips[NTRACK][NSLOT] __attribute__((section(".pool")));
+typedef struct {                                /* a history entry: absolute ms, raw MIDI */
+    uint32_t t_ms;
+    uint8_t  status, d1, d2, pad;
+} hev_t;
 
-/* per-track transport */
-enum { T_IDLE = 0, T_ARMED, T_REC, T_PLAY, T_OVERDUB };
+/* big buffers in the zeroed pool */
+static clip_t clips[NTRACK][NSLOT] __attribute__((section(".pool")));
+static hev_t  hist[NTRACK][HIST_EVENTS] __attribute__((section(".pool")));
+
+/* per-track transport + history */
+enum { T_IDLE = 0, T_PLAY, T_OVERDUB };
 static struct {
     uint8_t  state;
-    int8_t   active;        /* the slot being played/recorded, -1 = none */
-    uint32_t origin_ms;     /* fm1_ms at which the current loop iteration (or capture) began */
-    uint16_t play_pos;      /* last playback position emitted this iteration (ms) */
-    uint8_t  sounding[128]; /* notes this track's playback currently holds on (for clean stop) */
+    int8_t   active;        /* the slot being played/overdubbed, -1 = none */
+    uint32_t origin_ms;     /* fm1_ms at which the current loop iteration began */
+    uint16_t play_pos;      /* next ms position to emit this iteration */
+    uint32_t h_head;        /* history ring write index (monotone; & (HIST_EVENTS-1) to index) */
+    uint32_t last_ev_ms;    /* fm1_ms of the last logged event (for phrase-gap detection) */
+    uint8_t  sounding[128]; /* notes this track's playback currently holds on */
 } tr[NTRACK];
 
-static uint8_t cur_track;   /* 0..7, chosen by SELECT */
+static uint8_t  cur_track;                      /* 0..7, chosen by SELECT */
+static uint32_t proj_bpm;                       /* 0 until the first capture sets it */
+static uint32_t proj_bar_ms;                    /* one 4/4 bar in ms at proj_bpm */
+static uint32_t last_cap_bars;                  /* last capture's bar count (shown on screen) */
 
-/* record one event into a clip (used by live capture and overdub) */
+/* ---- history ring (always on) */
+static void hist_add(uint32_t t, uint8_t st, uint8_t d1, uint8_t d2)
+{
+    uint32_t i = tr[t].h_head & (HIST_EVENTS - 1u);
+    hist[t][i].t_ms = fm1_ms;
+    hist[t][i].status = st;
+    hist[t][i].d1 = d1;
+    hist[t][i].d2 = d2;
+    tr[t].h_head++;
+    tr[t].last_ev_ms = fm1_ms;
+}
+
+/* ---- clip helpers */
 static void clip_add(clip_t *c, uint32_t ms, uint8_t st, uint8_t d1, uint8_t d2)
 {
-    if (c->n >= CLIP_EVENTS) return;            /* clip full: drop (Phase 1 keeps it simple) */
+    if (c->n >= CLIP_EVENTS) return;
     if (ms > 0xFFFFu) ms = 0xFFFFu;
     c->ev[c->n].ms = (uint16_t)ms;
     c->ev[c->n].status = st;
@@ -166,7 +199,6 @@ static void clip_add(clip_t *c, uint32_t ms, uint8_t st, uint8_t d1, uint8_t d2)
     c->n++;
 }
 
-/* silence every note a track is holding from playback */
 static void track_hush(uint32_t t, uint32_t out_ch)
 {
     uint32_t i;
@@ -178,17 +210,14 @@ static void track_hush(uint32_t t, uint32_t out_ch)
         }
 }
 
-/* emit one recorded event: out to MIDI and into the internal monitor */
 static void clip_emit(uint32_t t, uint32_t out_ch, const ev_t *e)
 {
     uint32_t ty = e->status & 0xF0u;
-    midi_send((uint8_t)(ty | out_ch), e->d1, e->d2);   /* external out on the track's channel */
+    midi_send((uint8_t)(ty | out_ch), e->d1, e->d2);
     if (ty == 0x90u && e->d2) { play(e->d1, e->d2); tr[t].sounding[e->d1 & 0x7Fu] = 1; }
     else if (ty == 0x80u || ty == 0x90u) { stop(e->d1); tr[t].sounding[e->d1 & 0x7Fu] = 0; }
-    /* CC / pitch-bend (0xB0/0xE0) are sent out; the monitor ignores them for now (Phase 4) */
 }
 
-/* emit every event with from <= ms <= to (inclusive both ends) */
 static void player_window(uint32_t t, uint32_t out_ch, uint32_t from, uint32_t to)
 {
     clip_t *c = &clips[t][tr[t].active];
@@ -198,21 +227,20 @@ static void player_window(uint32_t t, uint32_t out_ch, uint32_t from, uint32_t t
             clip_emit(t, out_ch, &c->ev[i]);
 }
 
-/* called every main-loop pass: drive playback / overdub timing for every track.
- * play_pos holds the next ms position still to emit (0 at the start of a loop iteration). */
 static void player_tick(void)
 {
     uint32_t t;
     for (t = 0; t < NTRACK; t++) {
-        uint32_t out_ch, st = tr[t].state;
+        uint32_t out_ch;
         clip_t *c;
-        if (st != T_PLAY && st != T_OVERDUB) continue;
+        if (tr[t].state != T_PLAY && tr[t].state != T_OVERDUB) continue;
+        if (tr[t].active < 0) continue;
         c = &clips[t][tr[t].active];
         if (!c->len_ms) continue;
-        out_ch = set.ch ? set.ch - 1u : 0u;     /* Phase 1: one channel; per-track in Phase 3 */
+        out_ch = out_channel();
         {
             uint32_t elapsed = fm1_ms - tr[t].origin_ms;
-            uint32_t pos = elapsed % c->len_ms;  /* 0 .. len_ms-1 */
+            uint32_t pos = elapsed % c->len_ms;
             uint32_t from = tr[t].play_pos;
             if (pos < from) {                    /* wrapped: finish the tail, then the new head */
                 player_window(t, out_ch, from, (uint32_t)c->len_ms - 1u);
@@ -224,24 +252,137 @@ static void player_tick(void)
     }
 }
 
+/* ---- tempo/length detection on the recent history (integer only) --------------------
+ * Returns 1 on success, filling *out_bars and (if the project BPM is not yet set) *out_bpm.
+ * start_ms/end_ms frame the captured region (absolute ms). */
+static uint32_t insert_sort_u32(uint32_t *a, uint32_t n)   /* small n; returns n */
+{
+    uint32_t i, j;
+    for (i = 1; i < n; i++) {
+        uint32_t v = a[i];
+        for (j = i; j > 0 && a[j - 1] > v; j--) a[j] = a[j - 1];
+        a[j] = v;
+    }
+    return n;
+}
+
+/* gather note-on onset times (absolute ms) from a track's history within [start,end] */
+static uint32_t gather_onsets(uint32_t t, uint32_t start_ms, uint32_t end_ms, uint32_t *onset, uint32_t cap)
+{
+    uint32_t count = 0, scanned = tr[t].h_head < HIST_EVENTS ? tr[t].h_head : HIST_EVENTS;
+    uint32_t base = tr[t].h_head - scanned, k;
+    for (k = 0; k < scanned && count < cap; k++) {
+        hev_t *h = &hist[t][(base + k) & (HIST_EVENTS - 1u)];
+        if ((h->status & 0xF0u) == 0x90u && h->d2 &&
+            h->t_ms >= start_ms && h->t_ms <= end_ms)
+            onset[count++] = h->t_ms;
+    }
+    return count;
+}
+
+/* detect bars (and bpm if unknown) for a captured span. */
+static uint32_t detect_fit(uint32_t t, uint32_t start_ms, uint32_t end_ms,
+                           uint32_t *out_bpm, uint32_t *out_bars)
+{
+    uint32_t onset[64];
+    uint32_t m = gather_onsets(t, start_ms, end_ms, onset, 64u);
+    uint32_t span = end_ms - start_ms;
+    uint32_t bar_ms, bars, bpm;
+    if (span < 1u) return 0;
+
+    if (proj_bpm) {                              /* grid already known: just snap to whole bars */
+        bar_ms = proj_bar_ms;
+        bars = (span + bar_ms / 2u) / bar_ms;
+        if (bars < 1u) bars = 1u;
+        if (bars > MAX_BARS) bars = MAX_BARS;
+        *out_bpm = proj_bpm;
+        *out_bars = bars;
+        return 1;
+    }
+
+    /* first capture: derive the tempo. Use the median inter-onset gap as the beat unit. */
+    if (m >= 3u) {
+        uint32_t gaps[63], g = 0, i, beat_ms;
+        insert_sort_u32(onset, m);               /* onsets may be out of order across the ring wrap */
+        for (i = 1; i < m; i++)
+            if (onset[i] > onset[i - 1]) gaps[g++] = onset[i] - onset[i - 1];
+        if (!g) return 0;
+        insert_sort_u32(gaps, g);
+        beat_ms = gaps[g / 2u];                  /* median gap ~ one beat (or a subdivision) */
+        if (!beat_ms) return 0;
+        /* fold the beat into the 80..160 BPM range: a quarter = 60000/BPM ms => 375..750 ms */
+        while (beat_ms > 60000u / BPM_MIN) beat_ms /= 2u;   /* too slow: halve */
+        while (beat_ms < 60000u / BPM_MAX) beat_ms *= 2u;   /* too fast: double */
+        if (!beat_ms) beat_ms = 60000u / 120u;
+        bpm = (60000u + beat_ms / 2u) / beat_ms;
+    } else {
+        bpm = 120u;                              /* too few notes: fall back */
+    }
+
+    bar_ms = 4u * 60000u / bpm;                  /* 4/4 */
+    if (!bar_ms) return 0;
+    bars = (span + bar_ms / 2u) / bar_ms;        /* nearest whole bars */
+    if (bars < 1u) bars = 1u;
+    if (bars > MAX_BARS) bars = MAX_BARS;
+
+    /* back-solve: make the loop exactly `bars` bars long so it is seamless, then report that BPM */
+    bar_ms = span / bars;
+    if (bar_ms < 1u) bar_ms = 1u;
+    bpm = 4u * 60000u / bar_ms;
+    *out_bpm = bpm;
+    *out_bars = bars;
+    return 1;
+}
+
+/* build a clip from a track's recent history, [start,end] -> slot, rebased to start, length = len_ms */
+static void build_clip(uint32_t t, uint32_t slot, uint32_t start_ms, uint32_t end_ms, uint32_t len_ms)
+{
+    clip_t *c = &clips[t][slot];
+    uint32_t scanned = tr[t].h_head < HIST_EVENTS ? tr[t].h_head : HIST_EVENTS;
+    uint32_t base = tr[t].h_head - scanned, k;
+    c->n = 0;
+    for (k = 0; k < scanned; k++) {
+        hev_t *h = &hist[t][(base + k) & (HIST_EVENTS - 1u)];
+        uint32_t ty = h->status & 0xF0u;
+        if (h->t_ms < start_ms || h->t_ms > end_ms) continue;
+        if (ty != 0x90u && ty != 0x80u && ty != 0xB0u && ty != 0xE0u) continue;
+        clip_add(c, (h->t_ms - start_ms) % (len_ms ? len_ms : 1u), h->status, h->d1, h->d2);
+    }
+    c->len_ms = (uint16_t)(len_ms > 0xFFFFu ? 0xFFFFu : len_ms < 1u ? 1u : len_ms);
+}
+
+/* find where the recent phrase started: walk history back from the press until a gap > PHRASE_GAP_MS */
+static uint32_t phrase_start_ms(uint32_t t, uint32_t end_ms)
+{
+    uint32_t scanned = tr[t].h_head < HIST_EVENTS ? tr[t].h_head : HIST_EVENTS;
+    uint32_t base = tr[t].h_head - scanned, k, prev = 0, start = end_ms, have = 0;
+    for (k = 0; k < scanned; k++) {
+        hev_t *h = &hist[t][(base + k) & (HIST_EVENTS - 1u)];
+        if ((h->status & 0xF0u) != 0x90u || !h->d2) continue;
+        if (h->t_ms > end_ms) continue;
+        if (have && h->t_ms - prev > PHRASE_GAP_MS) start = h->t_ms;   /* a gap: phrase restarts here */
+        else if (!have) start = h->t_ms;
+        prev = h->t_ms;
+        have = 1;
+    }
+    return have ? start : end_ms;
+}
+
 /* ---- the screen */
 #define C_ACC RGB(180, 140, 255)                /* lilac */
-#define C_KEY RGB(210, 210, 210)
 #define C_OFF RGB(90, 90, 90)
 #define C_REC RGB(255, 70, 70)
 #define C_PLY RGB(80, 230, 120)
-#define C_ARM RGB(255, 190, 60)
 #define KEY0 53u                                /* MIDI note of key 0 (F3) */
 
 static const char *state_name(uint32_t s)
 {
-    return s == T_REC ? "REC" : s == T_OVERDUB ? "DUB" : s == T_PLAY ? "PLAY"
-         : s == T_ARMED ? "ARM" : "IDLE";
+    return s == T_OVERDUB ? "DUB" : s == T_PLAY ? "PLAY" : "LISTEN";
 }
 
 static void draw_track(void)                    /* big: active track number + its state */
 {
-    char s[12] = "TRK 1 ";
+    char s[14] = "TRK 1 ";
     const char *p;
     uint32_t i = 6;
     s[4] = (char)('1' + cur_track);
@@ -251,7 +392,7 @@ static void draw_track(void)                    /* big: active track number + it
     draw_text_box(0, 82, 240, &FONT_L, s, C_WHITE, 1);
 }
 
-static void draw_slots(void)                    /* the 8 clip slots of the active track */
+static void draw_slots(void)
 {
     uint32_t i;
     cv_begin(240, 40, C_BLACK);
@@ -260,9 +401,7 @@ static void draw_slots(void)                    /* the 8 clip slots of the activ
         uint32_t filled = clips[cur_track][i].len_ms != 0u;
         uint32_t playing = (tr[cur_track].state == T_PLAY || tr[cur_track].state == T_OVERDUB)
                            && tr[cur_track].active == (int8_t)i;
-        uint32_t recing = (tr[cur_track].state == T_REC || tr[cur_track].state == T_ARMED)
-                          && tr[cur_track].active == (int8_t)i;
-        uint32_t col = recing ? (tr[cur_track].state == T_ARMED ? C_ARM : C_REC)
+        uint32_t col = tr[cur_track].state == T_OVERDUB && playing ? C_REC
                      : playing ? C_PLY : filled ? C_ACC : C_OFF;
         cv_rect((int32_t)x, 8, 24, 24, col);
     }
@@ -280,19 +419,27 @@ static void draw_status(int32_t oct, uint32_t ch)
     draw_text_box(0, 212, 240, &FONT_S, s, C_OFF, 1);
 }
 
-static void draw_midi(uint32_t src, uint32_t bpm, uint32_t running)
+/* shows the project BPM and the last capture's bar count */
+static void draw_info(void)
 {
-    char s[32] = "", *p = s;
-    const char *a = src == 2u ? "TRS IN" : src == 1u ? "USB IN" : "";
-    while (*a) *p++ = *a++;
+    char s[32], *p = s;
+    const char *a;
+    uint32_t bpm = proj_bpm;
     if (bpm) {
-        if (p != s) { *p++ = ' '; *p++ = ' '; }
-        a = running ? "CLOCK " : "clock ";
+        a = "BPM ";
         while (*a) *p++ = *a++;
-        if (bpm >= 100u) *p++ = (char)('0' + bpm / 100u);
+        if (bpm >= 100u) *p++ = (char)('0' + bpm / 100u % 10u);
         *p++ = (char)('0' + bpm / 10u % 10u);
         *p++ = (char)('0' + bpm % 10u);
-        a = " BPM";
+        if (last_cap_bars) {
+            *p++ = ' '; *p++ = ' ';
+            if (last_cap_bars >= 10u) *p++ = (char)('0' + last_cap_bars / 10u);
+            *p++ = (char)('0' + last_cap_bars % 10u);
+            a = " BAR";
+            while (*a) *p++ = *a++;
+        }
+    } else {
+        a = "PLAY THEN REC";
         while (*a) *p++ = *a++;
     }
     *p = 0;
@@ -302,32 +449,13 @@ static void draw_midi(uint32_t src, uint32_t bpm, uint32_t running)
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
 static uint32_t idle_ok, midi_src, clk_n, clk_t0, clk_bpm, clk_run, clk_beat_ms;
 
-/* capture an incoming event into whatever track is recording/overdubbing */
-static void capture_event(uint8_t st, uint8_t d1, uint8_t d2)
-{
-    uint32_t t = cur_track, state = tr[t].state;
-    clip_t *c;
-    uint32_t ms;
-    if (state == T_ARMED) {                      /* first event starts the clock */
-        tr[t].state = T_REC;
-        tr[t].origin_ms = fm1_ms;
-        state = T_REC;
-    }
-    if (state != T_REC && state != T_OVERDUB) return;
-    c = &clips[t][tr[t].active];
-    ms = fm1_ms - tr[t].origin_ms;
-    if (state == T_OVERDUB && c->len_ms)         /* overdub: wrap into the loop so it replays */
-        ms %= c->len_ms;
-    clip_add(c, ms, st, d1, d2);
-}
-
 static void midi_in(void)
 {
     uint8_t st, d1, d2;
     int src;
     while ((src = midi_get(&st, &d1, &d2)) != 0) {   /* 1 USB, 2 the TRS jack */
         uint32_t ty = st & 0xF0u;
-        if (st == 0xF8u) {                      /* clock: 24 a quarter note */
+        if (st == 0xF8u) {
             if (clk_n % 24u == 0u) {
                 if (clk_n) {
                     uint32_t ms = fm1_ms - clk_t0;
@@ -346,9 +474,9 @@ static void midi_in(void)
         if (ty == 0x90u && d2) { play(d1, d2); midi_src = (uint32_t)src; }
         else if (ty == 0x80u || ty == 0x90u) stop(d1);
         if (ty == 0x90u || ty == 0x80u || ty == 0xB0u || ty == 0xE0u) {
-            uint32_t out_ch = set.ch ? set.ch - 1u : 0u;
+            uint32_t out_ch = out_channel();
             midi_send((uint8_t)(ty | out_ch), d1, d2);          /* echo / thru */
-            capture_event(st, d1, d2);                          /* record if armed/recording */
+            hist_add(cur_track, st, d1, d2);                    /* always logging */
         }
     }
 }
@@ -357,8 +485,8 @@ static void app_idle(void)
     if (idle_ok) midi_in();
 }
 
-/* ---- looper transport actions (from the panel) */
-static void clip_start(uint32_t t, uint32_t slot)   /* begin playing a filled slot */
+/* ---- transport actions ---------------------------------------------------------------- */
+static void clip_launch(uint32_t t, uint32_t slot)
 {
     tr[t].active = (int8_t)slot;
     tr[t].origin_ms = fm1_ms;
@@ -366,41 +494,49 @@ static void clip_start(uint32_t t, uint32_t slot)   /* begin playing a filled sl
     tr[t].state = T_PLAY;
 }
 
-static void slot_press(uint32_t slot)               /* a clip pad on the active track */
-{
-    uint32_t t = cur_track;
-    track_hush(t, out_channel());                   /* stop whatever this track was holding */
-    tr[t].play_pos = 0;
-    if (clips[t][slot].len_ms) {                    /* filled: stop current, launch this one */
-        clip_start(t, slot);
-    } else {                                        /* empty: arm for capture */
-        tr[t].active = (int8_t)slot;
-        tr[t].state = T_ARMED;
-    }
-}
-
+/* REC: retrospectively capture the recent phrase into the selected (or first empty) slot */
 static void rec_press(void)
 {
-    uint32_t t = cur_track, state = tr[t].state;
-    clip_t *c;
-    if (tr[t].active < 0) {                          /* nothing selected: arm slot 0 */
-        tr[t].active = 0;
-        tr[t].state = T_ARMED;
+    uint32_t t = cur_track, end = fm1_ms, start, bpm = 0, bars = 0, len;
+    int slot = tr[t].active;
+
+    if ((tr[t].state == T_PLAY || tr[t].state == T_OVERDUB) && slot >= 0) {
+        tr[t].state = tr[t].state == T_PLAY ? T_OVERDUB : T_PLAY;   /* toggle overdub */
         return;
     }
-    c = &clips[t][tr[t].active];
-    if (state == T_ARMED) {                          /* arm -> start empty capture now */
-        tr[t].state = T_REC;
-        tr[t].origin_ms = fm1_ms;
-        c->n = 0;
-    } else if (state == T_REC) {                     /* close the loop */
-        uint32_t len = fm1_ms - tr[t].origin_ms;
-        c->len_ms = (uint16_t)(len < 1u ? 1u : len > 0xFFFFu ? 0xFFFFu : len);
-        clip_start(t, (uint32_t)tr[t].active);       /* straight into playback */
-    } else if (state == T_PLAY) {                    /* play -> overdub */
-        tr[t].state = T_OVERDUB;
-    } else if (state == T_OVERDUB) {                 /* overdub -> play */
-        tr[t].state = T_PLAY;
+    if (slot < 0) {                              /* no slot chosen: use the first empty one */
+        uint32_t i;
+        slot = 0;
+        for (i = 0; i < NSLOT; i++) if (!clips[t][i].len_ms) { slot = (int)i; break; }
+    }
+    start = phrase_start_ms(t, end);
+    if (!detect_fit(t, start, end, &bpm, &bars)) return;          /* nothing usable */
+
+    if (!proj_bpm) {                             /* first capture sets the project grid */
+        proj_bpm = bpm;
+        proj_bar_ms = 4u * 60000u / (bpm ? bpm : 120u);
+    }
+    len = bars * proj_bar_ms;                    /* exact whole bars at the grid */
+    build_clip(t, (uint32_t)slot, start, end, len);
+    last_cap_bars = bars;
+    track_hush(t, out_channel());
+    clip_launch(t, (uint32_t)slot);
+}
+
+static void slot_press(uint32_t slot)
+{
+    uint32_t t = cur_track;
+    if (clips[t][slot].len_ms) {                 /* filled */
+        if ((tr[t].state == T_PLAY || tr[t].state == T_OVERDUB) && tr[t].active == (int8_t)slot) {
+            track_hush(t, out_channel());        /* pressing the playing slot again: stop */
+            tr[t].state = T_IDLE;
+        } else {
+            track_hush(t, out_channel());
+            clip_launch(t, slot);
+        }
+    } else {
+        tr[t].active = (int8_t)slot;             /* empty: just select it as the capture target */
+        if (tr[t].state != T_PLAY && tr[t].state != T_OVERDUB) tr[t].state = T_IDLE;
     }
 }
 
@@ -411,20 +547,17 @@ static void play_press(void)
         track_hush(t, out_channel());
         tr[t].state = T_IDLE;
     } else if (tr[t].active >= 0 && clips[t][tr[t].active].len_ms) {
-        tr[t].play_pos = 0;
-        clip_start(t, (uint32_t)tr[t].active);
+        clip_launch(t, (uint32_t)tr[t].active);
     }
 }
 
 static void app_main(void)
 {
     uint32_t prev = 0, k, t_change = 0, dirty = 0;
-    uint32_t track_drawn = ~0u, slots_drawn = ~0u, status_drawn = ~0u, midi_drawn = ~0u;
+    uint32_t track_drawn = ~0u, slots_drawn = ~0u, status_drawn = ~0u, info_drawn = ~0u;
     uint8_t held[27] = {0};
     uint32_t i;
 #if BOARD_SMK37
-    static const uint8_t WHITE[16] = {0, 2, 4, 6, 7, 9, 11, 12, 14, 16, 18, 19, 21, 23, 24, 26};
-    uint8_t pad_note[16] = {0}, ext_note[FM1_NKEY] = {0};
     smk_pw_t wheel = {0};
     smk_pad_events = 1;
 #endif
@@ -457,16 +590,16 @@ static void app_main(void)
                 if (down >> k & 1u) slot_press(k - PAD0);
                 continue;
             }
-            if (down >> k & 1u) {                   /* a note key: play, echo, and capture */
+            if (down >> k & 1u) {                   /* a note key: play, echo, and log to history */
                 held[k] = (uint8_t)(base + k);
                 play(held[k], vel);
                 midi_send(0x90u | out_ch, held[k], vel);
-                capture_event((uint8_t)(0x90u | out_ch), held[k], (uint8_t)vel);
+                hist_add(cur_track, (uint8_t)(0x90u | out_ch), held[k], (uint8_t)vel);
             }
             if (up >> k & 1u) {
                 stop(held[k]);
                 midi_send(0x80u | out_ch, held[k], 0);
-                capture_event((uint8_t)(0x80u | out_ch), held[k], 0);
+                hist_add(cur_track, (uint8_t)(0x80u | out_ch), held[k], 0);
             }
         }
 #if BOARD_SMK37
@@ -474,7 +607,6 @@ static void app_main(void)
             int32_t bd = smk_pw_bend(&wheel, fm1_in.wheel[0], fm1_ms);
             bend_q16 = (uint32_t)(65536 + (bd * 3785 >> 12) + (((bd * bd) >> 12) * 109 >> 12));
         }
-        (void)pad_note; (void)ext_note;
 #endif
 
         b = fm1_input_edges(&rel);
@@ -495,10 +627,10 @@ static void app_main(void)
         }
 
         midi_in();
-        player_tick();                                  /* drive playback / overdub */
+        player_tick();
         if (clk_bpm && fm1_ms - clk_t0 > 2000u) clk_bpm = 0, clk_run = 0;
 
-        /* LEDs: the 8 clip pads show state, the note keys show what sounds */
+        /* LEDs: clip pads show state, note keys show what sounds */
         {
             uint32_t vlit = 0, v;
             for (v = 0; v < NV; v++)
@@ -509,28 +641,25 @@ static void app_main(void)
             for (k = 0; k < NSLOT; k++) {
                 uint32_t playing = (tr[cur_track].state == T_PLAY || tr[cur_track].state == T_OVERDUB)
                                    && tr[cur_track].active == (int8_t)k;
-                uint32_t recing = (tr[cur_track].state == T_REC || tr[cur_track].state == T_ARMED)
-                                  && tr[cur_track].active == (int8_t)k;
                 uint32_t filled = clips[cur_track][k].len_ms != 0u;
-                fm1_led_key(KEY_LED(PAD0 + k), playing || recing);
-                if (!(playing || recing) && filled) fm1_led_key_glow(KEY_LED(PAD0 + k), 1);
+                fm1_led_key(KEY_LED(PAD0 + k), playing);
+                if (!playing && filled) fm1_led_key_glow(KEY_LED(PAD0 + k), 1);
             }
         }
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
-        fm1_led_key(BTN_REC, tr[cur_track].state == T_REC || tr[cur_track].state == T_OVERDUB
-                              || tr[cur_track].state == T_ARMED);
         fm1_led_key(BTN_PLAY, tr[cur_track].state == T_PLAY || tr[cur_track].state == T_OVERDUB);
+        fm1_led_key(BTN_REC, tr[cur_track].state == T_OVERDUB);
 
         idle_ok = 1;
         if ((st = (uint32_t)cur_track << 4 | tr[cur_track].state) != track_drawn) { track_drawn = st; draw_track(); }
-        {   /* slots view changes with selection, fill, and transport */
+        {
             uint32_t sig = cur_track << 24 | (uint32_t)tr[cur_track].state << 20 | (uint32_t)(tr[cur_track].active + 1) << 16;
             for (k = 0; k < NSLOT; k++) sig ^= (clips[cur_track][k].len_ms ? 1u : 0u) << k;
             if (sig != slots_drawn) { slots_drawn = sig; draw_slots(); }
         }
         if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4) != status_drawn) { status_drawn = st; draw_status(oct, set.ch); }
-        if ((st = midi_src | clk_bpm << 2 | clk_run << 12) != midi_drawn) { midi_drawn = st; draw_midi(midi_src, clk_bpm, clk_run); }
+        if ((st = proj_bpm | last_cap_bars << 16) != info_drawn) { info_drawn = st; draw_info(); }
         idle_ok = 0;
 
         if (dirty && quiet() && fm1_ms - t_change > 2000u) {

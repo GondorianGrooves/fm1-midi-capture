@@ -213,15 +213,18 @@ static void track_hush(uint32_t t, uint32_t out_ch)
 static void clip_emit(uint32_t t, uint32_t out_ch, const ev_t *e)
 {
     uint32_t ty = e->status & 0xF0u, note = e->d1 & 0x7Fu;
-    if (ty == 0x90u && e->d2) {
-        if (tr[t].sounding[note]) { stop(e->d1); }      /* retrigger: kill the old voice first (no comb) */
-        midi_send((uint8_t)(0x90u | out_ch), e->d1, e->d2);
-        play(e->d1, e->d2);
-        tr[t].sounding[note] = 1;
-    } else if (ty == 0x80u || ty == 0x90u) {
-        midi_send((uint8_t)(0x80u | out_ch), e->d1, 0);
-        stop(e->d1);
-        tr[t].sounding[note] = 0;
+    if (ty == 0x90u && e->d2) {                         /* note-on: only if not already sounding */
+        if (!tr[t].sounding[note]) {
+            midi_send((uint8_t)(0x90u | out_ch), e->d1, e->d2);
+            play(e->d1, e->d2);
+            tr[t].sounding[note] = 1;
+        }
+    } else if (ty == 0x80u || ty == 0x90u) {            /* note-off: only if sounding */
+        if (tr[t].sounding[note]) {
+            midi_send((uint8_t)(0x80u | out_ch), e->d1, 0);
+            stop(e->d1);
+            tr[t].sounding[note] = 0;
+        }
     } else {                                            /* CC / pitch-bend: pass out only */
         midi_send((uint8_t)(ty | out_ch), e->d1, e->d2);
     }
@@ -331,8 +334,23 @@ static uint32_t detect_fit(uint32_t t, uint32_t start_ms, uint32_t end_ms,
 
     bar_ms = 4u * 60000u / bpm;                  /* 4/4 */
     if (!bar_ms) return 0;
-    bars = (span + bar_ms / 2u) / bar_ms;        /* nearest whole bars */
-    if (bars < 1u) bars = 1u;
+
+    /* Weighted snap (first clip only): prefer common lengths so the project grid is sane and other
+     * clips don't phase by accident. Powers of two first, then the musical 3/6/12 (waltz, blues),
+     * then any whole number. Each candidate gets a tolerance bonus by its priority: a span near a
+     * "nice" length is pulled to it, but a clearly-3-bar phrase still resolves to 3. */
+    {
+        static const uint8_t CAND[] = {1, 2, 4, 8, 16, 3, 6, 12};
+        uint32_t best = 0, best_score = 0xFFFFFFFFu, ci;
+        for (ci = 0; ci < sizeof CAND; ci++) {
+            uint32_t cand = CAND[ci];
+            uint32_t want = cand * bar_ms;        /* ideal span for this many bars */
+            uint32_t diff = span > want ? span - want : want - span;
+            uint32_t score = diff + ci * (bar_ms / 8u);   /* +cost by priority (earlier = cheaper) */
+            if (score < best_score) { best_score = score; best = cand; }
+        }
+        bars = best ? best : 1u;
+    }
     if (bars > MAX_BARS) bars = MAX_BARS;
 
     /* back-solve: make the loop exactly `bars` bars long so it is seamless, then report that BPM */
@@ -485,11 +503,10 @@ static void midi_in(void)
         if (set.ch && (st & 15u) != set.ch - 1u) continue;      /* not our channel */
         if (ty == 0x90u && d2) { play(d1, d2); midi_src = (uint32_t)src; }
         else if (ty == 0x80u || ty == 0x90u) stop(d1);
-        if (ty == 0x90u || ty == 0x80u || ty == 0xB0u || ty == 0xE0u) {
-            uint32_t out_ch = out_channel();
-            midi_send((uint8_t)(ty | out_ch), d1, d2);          /* echo / thru */
+        /* NOTE: incoming MIDI is NOT echoed back out (that could loop back in the emulator and
+         * double every note -> the "weird sine"). It still sounds via play() and is logged. */
+        if (ty == 0x90u || ty == 0x80u || ty == 0xB0u || ty == 0xE0u)
             hist_add(cur_track, st, d1, d2);                    /* always logging */
-        }
     }
 }
 static void app_idle(void)

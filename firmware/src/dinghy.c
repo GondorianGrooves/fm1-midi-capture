@@ -358,10 +358,14 @@ static uint32_t detect_fit(uint32_t t, uint32_t start_ms, uint32_t end_ms,
     }
     if (bars > MAX_BARS) bars = MAX_BARS;
 
-    /* back-solve: make the loop exactly `bars` bars long so it is seamless, then report that BPM */
+    /* back-solve: make the loop exactly `bars` bars long so it is seamless. Keep the resulting tempo
+     * in the 80..160 range the same way Ableton does: a 2-bar loop at 67 BPM is a 4-bar loop at 134
+     * for the same audio, so double the bars (halve the implied tempo) until the BPM lands in range. */
     bar_ms = span / bars;
     if (bar_ms < 1u) bar_ms = 1u;
     bpm = 4u * 60000u / bar_ms;
+    while (bpm && bpm < BPM_MIN && bars * 2u <= MAX_BARS) { bars *= 2u; bar_ms = span / bars; bpm = bar_ms ? 4u * 60000u / bar_ms : 0u; }
+    while (bpm > BPM_MAX && bars > 1u && (bars & 1u) == 0u) { bars /= 2u; bar_ms = span / bars; bpm = bar_ms ? 4u * 60000u / bar_ms : 0u; }
     *out_bpm = bpm;
     *out_bars = bars;
     return 1;

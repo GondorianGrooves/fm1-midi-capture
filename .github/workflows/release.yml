@@ -49,6 +49,18 @@ jobs:
       - name: Host tests
         run: sh tests/run_tests.sh
 
+      - name: Diagnostic WAV (capture + playback, host mode)
+        run: |
+          sh tests/run_host.sh tests/scripts/capture_loop.txt | tee build/host/capture_trace.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capture-diagnostic
+          path: |
+            build/host/dinghy.wav
+            build/host/capture_trace.txt
+          if-no-files-found: warn
+
       - name: Release packages (tags only)
         if: github.ref_type == 'tag'
         run: |

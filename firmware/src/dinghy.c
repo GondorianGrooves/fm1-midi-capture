@@ -212,10 +212,19 @@ static void track_hush(uint32_t t, uint32_t out_ch)
 
 static void clip_emit(uint32_t t, uint32_t out_ch, const ev_t *e)
 {
-    uint32_t ty = e->status & 0xF0u;
-    midi_send((uint8_t)(ty | out_ch), e->d1, e->d2);
-    if (ty == 0x90u && e->d2) { play(e->d1, e->d2); tr[t].sounding[e->d1 & 0x7Fu] = 1; }
-    else if (ty == 0x80u || ty == 0x90u) { stop(e->d1); tr[t].sounding[e->d1 & 0x7Fu] = 0; }
+    uint32_t ty = e->status & 0xF0u, note = e->d1 & 0x7Fu;
+    if (ty == 0x90u && e->d2) {
+        if (tr[t].sounding[note]) { stop(e->d1); }      /* retrigger: kill the old voice first (no comb) */
+        midi_send((uint8_t)(0x90u | out_ch), e->d1, e->d2);
+        play(e->d1, e->d2);
+        tr[t].sounding[note] = 1;
+    } else if (ty == 0x80u || ty == 0x90u) {
+        midi_send((uint8_t)(0x80u | out_ch), e->d1, 0);
+        stop(e->d1);
+        tr[t].sounding[note] = 0;
+    } else {                                            /* CC / pitch-bend: pass out only */
+        midi_send((uint8_t)(ty | out_ch), e->d1, e->d2);
+    }
 }
 
 static void player_window(uint32_t t, uint32_t out_ch, uint32_t from, uint32_t to)
@@ -242,8 +251,9 @@ static void player_tick(void)
             uint32_t elapsed = fm1_ms - tr[t].origin_ms;
             uint32_t pos = elapsed % c->len_ms;
             uint32_t from = tr[t].play_pos;
-            if (pos < from) {                    /* wrapped: finish the tail, then the new head */
+            if (pos < from) {                    /* wrapped: finish the tail, silence, then the new head */
                 player_window(t, out_ch, from, (uint32_t)c->len_ms - 1u);
+                track_hush(t, out_ch);           /* no held note bleeds into the next iteration */
                 from = 0;
             }
             player_window(t, out_ch, from, pos);
@@ -343,10 +353,12 @@ static void build_clip(uint32_t t, uint32_t slot, uint32_t start_ms, uint32_t en
     c->n = 0;
     for (k = 0; k < scanned; k++) {
         hev_t *h = &hist[t][(base + k) & (HIST_EVENTS - 1u)];
-        uint32_t ty = h->status & 0xF0u;
+        uint32_t ty = h->status & 0xF0u, rel;
         if (h->t_ms < start_ms || h->t_ms > end_ms) continue;
         if (ty != 0x90u && ty != 0x80u && ty != 0xB0u && ty != 0xE0u) continue;
-        clip_add(c, (h->t_ms - start_ms) % (len_ms ? len_ms : 1u), h->status, h->d1, h->d2);
+        rel = h->t_ms - start_ms;               /* clamp into the loop (never wrap: keeps on/off order) */
+        if (len_ms && rel >= len_ms) rel = len_ms - 1u;
+        clip_add(c, rel, h->status, h->d1, h->d2);
     }
     c->len_ms = (uint16_t)(len_ms > 0xFFFFu ? 0xFFFFu : len_ms < 1u ? 1u : len_ms);
 }
@@ -540,14 +552,26 @@ static void slot_press(uint32_t slot)
     }
 }
 
+/* PLAY is the master transport: if anything is playing, stop every track; otherwise (re)launch every
+ * track that has an active clip, all from the same origin so they stay in sync. */
 static void play_press(void)
 {
-    uint32_t t = cur_track;
-    if (tr[t].state == T_PLAY || tr[t].state == T_OVERDUB) {
-        track_hush(t, out_channel());
-        tr[t].state = T_IDLE;
-    } else if (tr[t].active >= 0 && clips[t][tr[t].active].len_ms) {
-        clip_launch(t, (uint32_t)tr[t].active);
+    uint32_t t, any = 0;
+    for (t = 0; t < NTRACK; t++)
+        if (tr[t].state == T_PLAY || tr[t].state == T_OVERDUB) { any = 1; break; }
+    if (any) {                                   /* stop all */
+        for (t = 0; t < NTRACK; t++) {
+            track_hush(t, out_channel());
+            tr[t].state = T_IDLE;
+        }
+    } else {                                     /* start all that have a clip, in sync */
+        uint32_t now = fm1_ms;
+        for (t = 0; t < NTRACK; t++)
+            if (tr[t].active >= 0 && clips[t][tr[t].active].len_ms) {
+                tr[t].origin_ms = now;
+                tr[t].play_pos = 0;
+                tr[t].state = T_PLAY;
+            }
     }
 }
 
